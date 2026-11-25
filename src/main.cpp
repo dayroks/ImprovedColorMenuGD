@@ -80,12 +80,13 @@ namespace {
     }
 
     RowLayout* makeGridLayout() {
-        return RowLayout::create()
-            ->setCrossAxisOverflow(false)
-            ->setGrowCrossAxis(true)
-            ->setAxisAlignment(AxisAlignment::Center)
-            ->setCrossAxisAlignment(AxisAlignment::Center)
-            ->setGap(4.f);
+        auto layout = RowLayout::create();
+        layout->setCrossAxisOverflow(false);
+        layout->setGrowCrossAxis(true);
+        layout->setAxisAlignment(AxisAlignment::Center);
+        layout->setCrossAxisAlignment(AxisAlignment::Center);
+        layout->setGap(4.f);
+        return layout;
     }
 }
 
