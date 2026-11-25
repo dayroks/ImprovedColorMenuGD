@@ -1,15 +1,22 @@
 {
-	"geode": "6.0.0",
-	"gd": {
-		"win": "2.2091",
-		"android": "2.2091",
-		"mac": "2.2091",
-		"ios": "2.2091"
-	},
-	"id": "user.better-color-menu",
-	"name": "Better Color Menu",
-	"version": "v1.0.0",
-	"developer": "You",
-	"description": "Adds a scrollable list of ALL color channels with live previews to the Base Color menu (BetterEdit-style).",
-	"tags": ["editor", "enhancement", "interface"]
+    "geode": "6.0.0",
+    "gd": {
+        "win": "2.2091",
+        "android": "2.2091",
+        "mac": "2.2091",
+        "ios": "2.2091"
+    },
+    "id": "user.better-color-menu",
+    "name": "Better Color Menu",
+    "version": "v1.0.0",
+    "developer": "MisterLynx",
+    "description": "Replaces the Base/Detail color panel with a paged one: Special | Page N/M | Recent, with live color previews.",
+    "tags": [
+        "editor",
+        "enhancement",
+        "interface"
+    ],
+    "dependencies": {
+        "geode.node-ids": ">=1.21.0"
+    }
 }
