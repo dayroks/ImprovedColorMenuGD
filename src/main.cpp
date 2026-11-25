@@ -1,314 +1,450 @@
+// Improved Color Menu
+// Замінює панель "Base Color" / "Detail Color" (CustomizeObjectLayer) на панель зі сторінками:
+//   [ Special ]  [ Page N / M ]  [ Recent ]
+//
+// ВАЖЛИВО: ця панель належить класу CustomizeObjectLayer (вкладки Base / Detail / Text),
+// а не ColorSelectPopup (той — це колесо вибору кольору для самого каналу).
+// Для знаходження ванільних меню потрібен мод geode.node-ids (див. mod.json).
+
 #include <Geode/Geode.hpp>
-#include <Geode/modify/ColorSelectPopup.hpp>
+#include <Geode/modify/CustomizeObjectLayer.hpp>
 #include <algorithm>
-#include <map>
+#include <array>
+#include <functional>
+#include <string>
+#include <vector>
 
 using namespace geode::prelude;
 
-// ===== налаштування =====
-static constexpr int COLS = 5;               // колонок кольорів на сторінці
-static constexpr int ROWS = 4;               // рядків (5 x 4 = 20 іконок)
-static constexpr int PER_PAGE = COLS * ROWS;
-static constexpr int MAX_CHANNEL = 999;
-static constexpr int MAX_RECENT = 12;        // 3 x 4
-// ========================
+namespace {
+    constexpr int MAX_CHANNEL = 999;
+    constexpr int PER_PAGE = 35; // 7 x 5
+    constexpr int PAGE_COUNT = (MAX_CHANNEL + PER_PAGE - 1) / PER_PAGE;
+    constexpr size_t RECENT_COUNT = 15; // 3 x 5
 
-struct SpecialDef {
-    const char* label;
-    int id; // >=1000: спец-канал; -1..-4: оригінальна кнопка ванілі (Default, P-Col1, P-Col2, Light BG)
-};
+    // Порядок спец-каналів як на скріншоті: D P1 P2 / BC C1 MC / LBC C2 MC2 / OBJ L 3DL / LTR чорний білий
+    constexpr std::array<int, 15> SPECIAL_ORDER {
+        0,    1005, 1006,
+        1000, 1001, 1013,
+        1007, 1009, 1014,
+        1004, 1002, 1003,
+        1012, 1010, 1011,
+    };
 
-static const SpecialDef SPECIALS[15] = {
-    {"D", -1},   {"P1", -2},  {"P2", -3},
-    {"BC", 1000},{"C1", 1001},{"MC", 1013},
-    {"LBC", -4}, {"C2", 1009},{"MC2", 1014},
-    {"OBJ", 1004},{"L", 1002},{"3DL", 1003},
-    {"LTR", 1012},{"", 1010}, {"", 1011},
-};
+    int s_page = 0;           // остання відкрита сторінка (живе між відкриттями вікна)
+    int s_pending = 0;        // канал, який треба додати в Recent при закритті
+    std::vector<int> s_recent;
+    bool s_recentLoaded = false;
 
-class ColorPanel : public CCNode {
-protected:
-    ColorSelectPopup* m_popup = nullptr;
-    CCNode* m_layer = nullptr;
-    CCMenu* m_menu = nullptr;
-    std::vector<CCMenuItem*> m_orig; // [0]=P-Col1 [1]=P-Col2 [2]=Light BG [3]=Default
-    std::map<int, ColorAction*> m_actions;
-    std::vector<Ref<CCNode>> m_pageNodes;
-    std::vector<Ref<CCNode>> m_recentNodes;
-    CCLabelBMFont* m_pageLabel = nullptr;
-    CCRect m_panel;
-    float m_cell = 18.f;
-    float m_startX = 0.f;
-    float m_topY = 0.f;
-    int m_page = 0;
-    int m_pages = (MAX_CHANNEL + PER_PAGE - 1) / PER_PAGE;
-    int m_selected = 0;
-
-    CCPoint colCenter(float colOffset, int col, float rowOffset, int row) {
-        return {
-            m_startX + (colOffset + col + .5f) * m_cell,
-            m_topY - .9f * m_cell - (rowOffset + row + .5f) * m_cell
-        };
-    }
-
-    void place(CCNode* node, CCPoint layerPos) {
-        node->setPosition(m_menu->convertToNodeSpace(m_layer->convertToWorldSpace(layerPos)));
-    }
-
-    CCNode* makeSwatch(int id, std::string const& label, ccColor3B fallback) {
-        float size = m_cell * .9f;
-        CCNode* sw = nullptr;
-        auto it = m_actions.find(id);
-        if (it != m_actions.end()) {
-            auto spr = ColorChannelSprite::create();
-            spr->updateValues(it->second);
-            spr->setScale(size / std::max(1.f, spr->getContentSize().width));
-            sw = spr;
-        } else {
-            auto spr = CCScale9Sprite::create("square02_001.png");
-            spr->setContentSize({ size, size });
-            spr->setColor(fallback);
-            sw = spr;
+    std::string shortName(int channel) {
+        switch (channel) {
+            case 0: return "D";
+            case 1000: return "BC";
+            case 1001: return "C1";
+            case 1002: return "L";
+            case 1003: return "3DL";
+            case 1004: return "OBJ";
+            case 1005: return "P1";
+            case 1006: return "P2";
+            case 1007: return "LBC";
+            case 1009: return "C2";
+            case 1010: return "";
+            case 1011: return "";
+            case 1012: return "LTR";
+            case 1013: return "MC";
+            case 1014: return "MC2";
+            default: return std::to_string(channel);
         }
-        if (!label.empty()) {
-            auto lbl = CCLabelBMFont::create(label.c_str(), "bigFont.fnt");
-            lbl->limitLabelWidth(size * .8f, .4f, .1f);
-            lbl->setPosition(sw->getContentSize() / 2);
-            if (sw->getScale() != 0.f) lbl->setScale(lbl->getScale() / sw->getScale() * (sw->getScale() < 1.f ? 1.f : 1.f));
-            sw->addChild(lbl, 10);
-        }
-        return sw;
     }
 
-    CCMenuItemSpriteExtra* makeButton(CCNode* spr, int tag, SEL_MenuHandler cb) {
-        auto btn = CCMenuItemSpriteExtra::create(spr, nullptr, this, cb);
-        btn->setTag(tag);
+    std::string longName(int channel) {
+        if (channel > 0 && channel <= MAX_CHANNEL) return std::to_string(channel);
+        return GJSpecialColorSelect::textForColorIdx(channel);
+    }
+
+    void loadRecent() {
+        if (s_recentLoaded) return;
+        s_recentLoaded = true;
+        s_recent = Mod::get()->getSavedValue<std::vector<int>>("recent");
+        if (s_recent.size() > RECENT_COUNT) s_recent.resize(RECENT_COUNT);
+    }
+
+    void commitPending() {
+        if (s_pending == 0) return;
+        loadRecent();
+        s_recent.erase(std::remove(s_recent.begin(), s_recent.end(), s_pending), s_recent.end());
+        s_recent.insert(s_recent.begin(), s_pending);
+        if (s_recent.size() > RECENT_COUNT) s_recent.resize(RECENT_COUNT);
+        Mod::get()->setSavedValue("recent", s_recent);
+        s_pending = 0;
+    }
+
+    RowLayout* makeGridLayout() {
+        return RowLayout::create()
+            ->setCrossAxisOverflow(false)
+            ->setGrowCrossAxis(true)
+            ->setAxisAlignment(AxisAlignment::Center)
+            ->setCrossAxisAlignment(AxisAlignment::Center)
+            ->setGap(4.f);
+    }
+}
+
+class $modify(ICMCustomizeObjectLayer, CustomizeObjectLayer) {
+    struct Fields {
+        bool initDone = false;
+    };
+
+    // ---------- допоміжне ----------
+
+    static ColorAction* actionFor(int channel) {
+        auto editor = LevelEditorLayer::get();
+        if (!editor || !editor->m_levelSettings || !editor->m_levelSettings->m_effectManager) return nullptr;
+        return editor->m_levelSettings->m_effectManager->getColorAction(channel);
+    }
+
+    void refreshSprite(ColorChannelSprite* sprite) {
+        int channel = static_cast<int>(reinterpret_cast<intptr_t>(sprite->getUserData()));
+        if (channel == -1) return; // порожній слот у Recent
+        auto action = actionFor(channel);
+        if (!action) return;
+        sprite->updateValues(action);
+
+        switch (channel) {
+            case 1010: sprite->setColor({ 0, 0, 0 }); break;
+            case 0: sprite->setOpacity(50); break;
+            case 1007: sprite->setOpacity(120); break;
+        }
+        if (auto label = sprite->getChildByID("id-label")) {
+            label->setVisible(!action->m_copyID);
+        }
+    }
+
+    ColorChannelSprite* makeSprite(int channel, bool recentSlot) {
+        auto spr = ColorChannelSprite::create();
+        spr->setScale(.8f);
+        // tag перезаписується CCMenuItemSpriteExtra, тому канал зберігаємо в userData
+        spr->setUserData(reinterpret_cast<void*>(static_cast<intptr_t>(channel)));
+        spr->setID("channel-sprite"_spr);
+
+        if (recentSlot && channel == 0) {
+            // порожній слот
+            spr->setOpacity(105);
+            spr->setColor({ 20, 20, 20 });
+            spr->setUserData(reinterpret_cast<void*>(static_cast<intptr_t>(-1)));
+            return spr;
+        }
+
+        auto sel = CCSprite::createWithSpriteFrameName("GJ_select_001.png");
+        sel->setScale(1.1f);
+        sel->setID("selected-indicator");
+        sel->setPosition(spr->getContentSize() / 2);
+        sel->setVisible(false);
+        spr->addChild(sel);
+
+        auto label = CCLabelBMFont::create(shortName(channel).c_str(), "bigFont.fnt");
+        label->limitLabelWidth(25.f, .4f, .2f);
+        label->setPosition(spr->getContentSize() / 2);
+        label->setID("id-label");
+        spr->addChild(label);
+
+        this->refreshSprite(spr);
+        return spr;
+    }
+
+    CCMenuItemSpriteExtra* makeButton(int channel, bool recentSlot = false) {
+        auto btn = CCMenuItemSpriteExtra::create(
+            this->makeSprite(channel, recentSlot),
+            this, menu_selector(CustomizeObjectLayer::onSelectColor)
+        );
+        btn->setTag(channel);
+        btn->setID(fmt::format("channel-{}-button", channel));
+        if (recentSlot && channel == 0) btn->setEnabled(false);
         return btn;
     }
 
-    void addFrame(CCNode* btn) {
-        auto frame = CCScale9Sprite::create("GJ_square07.png");
-        float s = m_cell * 1.0f;
-        frame->setContentSize({ s, s });
-        frame->setPosition(btn->getContentSize() / 2);
-        btn->addChild(frame, 20);
-    }
-
-    void buildSpecials() {
-        auto gm = GameManager::get();
-        for (int i = 0; i < 15; i++) {
-            int col = i % 3;
-            int row = i / 3;
-            auto def = SPECIALS[i];
-            ccColor3B fb { 90, 90, 90 };
-            if (def.id == -1) fb = { 160, 90, 50 };
-            if (def.id == -2) fb = gm->colorForIdx(gm->getPlayerColor());
-            if (def.id == -3) fb = gm->colorForIdx(gm->getPlayerColor2());
-            if (def.id == -4) fb = { 170, 150, 140 };
-            if (def.id == 1010) fb = { 0, 0, 0 };
-            if (def.id == 1011) fb = { 255, 255, 255 };
-            auto sw = makeSwatch(def.id, def.label, fb);
-            auto btn = makeButton(sw, def.id, menu_selector(ColorPanel::onSpecial));
-            if (def.id >= 1000 && def.id == m_selected) addFrame(btn);
-            place(btn, colCenter(0.f, col, 0.f, row));
-            m_menu->addChild(btn);
+    void forEachButton(std::string const& id, std::function<void(CCMenuItemSpriteExtra*)> fn) {
+        auto menu = m_mainLayer->getChildByID(id);
+        if (!menu) return;
+        for (auto child : CCArrayExt<CCMenuItemSpriteExtra*>(menu->getChildren())) {
+            fn(child);
         }
     }
 
-    void buildPage() {
-        for (auto& n : m_pageNodes) n->removeFromParent();
-        m_pageNodes.clear();
-        for (int j = 0; j < PER_PAGE; j++) {
-            int id = m_page * PER_PAGE + j + 1;
-            if (id > MAX_CHANNEL) break;
-            auto sw = makeSwatch(id, std::to_string(id), { 90, 90, 90 });
-            auto btn = makeButton(sw, id, menu_selector(ColorPanel::onPick));
-            if (id == m_selected) addFrame(btn);
-            place(btn, colCenter(3.5f, j % COLS, .5f, j / COLS));
-            m_menu->addChild(btn);
-            m_pageNodes.push_back(btn);
-        }
-        if (m_pageLabel) {
-            m_pageLabel->setString(fmt::format("Page {} / {}", m_page + 1, m_pages).c_str());
-        }
+    void refreshAllSprites() {
+        auto refresh = [this](CCMenuItemSpriteExtra* b) {
+            if (auto spr = typeinfo_cast<ColorChannelSprite*>(b->getChildByID("channel-sprite"_spr))) {
+                this->refreshSprite(spr);
+            }
+        };
+        this->forEachButton("channels-menu", refresh);
+        this->forEachButton("special-channels-menu", refresh);
+        this->forEachButton("recent-channels-menu"_spr, refresh);
     }
 
-    void buildRecent() {
-        for (auto& n : m_recentNodes) n->removeFromParent();
-        m_recentNodes.clear();
-        auto recent = Mod::get()->getSavedValue<std::vector<int>>("recent");
-        for (int k = 0; k < MAX_RECENT && k < static_cast<int>(recent.size()); k++) {
-            int id = recent[k];
-            auto sw = makeSwatch(id, id >= 1000 ? "" : std::to_string(id), { 90, 90, 90 });
-            auto btn = makeButton(sw, id, menu_selector(ColorPanel::onSpecial));
-            place(btn, colCenter(3.5f + COLS + .5f, k % 3, .5f, k / 3));
-            m_menu->addChild(btn);
-            m_recentNodes.push_back(btn);
-        }
-    }
-
-    void addLabel(const char* text, CCPoint p, float width) {
-        auto lbl = CCLabelBMFont::create(text, "goldFont.fnt");
-        lbl->limitLabelWidth(width, .5f, .1f);
-        lbl->setPosition(p);
-        this->addChild(lbl, 2);
-    }
-
-    void pushRecent(int id) {
-        auto recent = Mod::get()->getSavedValue<std::vector<int>>("recent");
-        recent.erase(std::remove(recent.begin(), recent.end(), id), recent.end());
-        recent.insert(recent.begin(), id);
-        if (static_cast<int>(recent.size()) > MAX_RECENT) recent.resize(MAX_RECENT);
-        Mod::get()->setSavedValue("recent", recent);
-    }
-
-    void onPage(CCObject* sender) {
-        int dir = static_cast<CCNode*>(sender)->getTag();
-        m_page = (m_page + dir + m_pages) % m_pages;
-        this->buildPage();
-    }
-
-    void onPick(CCObject* sender) {
-        auto node = static_cast<CCNode*>(sender);
-        m_selected = node->getTag();
-        m_popup->onUpdateCustomColor(node); // ваніль читає tag = номер каналу
-        this->pushRecent(m_selected);
-        this->buildPage();
-        this->buildRecent();
-    }
-
-    void onSpecial(CCObject* sender) {
-        auto node = static_cast<CCNode*>(sender);
-        int id = node->getTag();
-        if (id < 0) {
-            int idx = (id == -1) ? 3 : (id == -2) ? 0 : (id == -3) ? 1 : 2;
-            if (idx < static_cast<int>(m_orig.size())) m_orig[idx]->activate();
-            return;
-        }
-        m_selected = id;
-        m_popup->onUpdateCustomColor(node);
-        if (id < 1000) this->pushRecent(id);
-        this->buildPage();
-        this->buildRecent();
-    }
-
-    bool init(ColorSelectPopup* popup, std::vector<CCMenuItem*> orig, CCRect bg) {
-        if (!CCNode::init()) return false;
-        m_popup = popup;
-        m_layer = popup->m_mainLayer;
-        m_menu = popup->m_buttonMenu;
-        m_orig = std::move(orig);
-        m_selected = popup->m_colorID;
-        if (m_selected > 0) m_page = std::clamp((m_selected - 1) / PER_PAGE, 0, m_pages - 1);
-
-        if (auto editor = LevelEditorLayer::get()) {
-            if (editor->m_effectManager) {
-                for (auto act : CCArrayExt<ColorAction*>(editor->m_effectManager->getAllColorActions())) {
-                    m_actions[act->m_colorID] = act;
+    void markSelected() {
+        int selected = this->getActiveMode(true);
+        auto mark = [selected](CCMenuItemSpriteExtra* b) {
+            if (auto spr = b->getChildByID("channel-sprite"_spr)) {
+                if (auto ind = spr->getChildByID("selected-indicator")) {
+                    ind->setVisible(b->getTag() == selected);
                 }
             }
+        };
+        this->forEachButton("channels-menu", mark);
+        this->forEachButton("special-channels-menu", mark);
+        this->forEachButton("recent-channels-menu"_spr, mark);
+    }
+
+    void gotoPage(int page) {
+        if (!m_fields->initDone) return;
+        auto menu = m_mainLayer->getChildByID("channels-menu");
+        if (!menu) return;
+
+        page = std::clamp(page, 0, PAGE_COUNT - 1);
+        s_page = page;
+
+        menu->removeAllChildren();
+        for (int i = 1; i <= PER_PAGE; i++) {
+            int channel = page * PER_PAGE + i;
+            if (channel > MAX_CHANNEL) break;
+            menu->addChild(this->makeButton(channel));
+        }
+        menu->updateLayout();
+
+        if (auto pageMenu = m_mainLayer->getChildByID("page-menu"_spr)) {
+            if (auto label = typeinfo_cast<CCLabelBMFont*>(pageMenu->getChildByID("current-page"))) {
+                label->setString(fmt::format("Page {} / {}", page + 1, PAGE_COUNT).c_str());
+            }
+        }
+        this->markSelected();
+    }
+
+    void gotoPageWithChannel(int channel) {
+        if (channel > 0 && channel <= MAX_CHANNEL) {
+            this->gotoPage((channel - 1) / PER_PAGE);
+        }
+    }
+
+    void onICMPage(CCObject* sender) {
+        this->gotoPage(s_page + sender->getTag());
+    }
+
+    // Те, що треба зробити після зміни каналу НЕ через onSelectColor (стрілки, текстове поле).
+    void channelChanged(int channel) {
+        m_customColorChannel = channel;
+        s_pending = channel;
+        this->gotoPageWithChannel(channel);
+    }
+
+    // ---------- перевизначення ванільних методів ----------
+
+    $override
+    void onSelectColor(CCObject* sender) {
+        if (!m_fields->initDone) return CustomizeObjectLayer::onSelectColor(sender);
+
+        // gotoPage видаляє кнопки, у тому числі саму sender — тримаємо її живою
+        auto keepAlive = Ref(sender);
+        int channel = sender->getTag();
+        CustomizeObjectLayer::onSelectColor(sender);
+        if (!channel) channel = this->getActiveMode(true); // "Default" -> реальний канал
+
+        m_customColorChannel = channel;
+        this->updateCustomColorLabels();
+        this->gotoPageWithChannel(channel);
+        if (channel != 0) s_pending = channel;
+    }
+
+    $override
+    void highlightSelected(ButtonSprite* sprite) {
+        if (!m_fields->initDone) return CustomizeObjectLayer::highlightSelected(sprite);
+        this->markSelected();
+    }
+
+    $override
+    void updateColorSprite() {
+        CustomizeObjectLayer::updateColorSprite();
+        if (m_fields->initDone) this->refreshAllSprites();
+    }
+
+    $override
+    void updateCustomColorLabels() {
+        if (!m_fields->initDone) return CustomizeObjectLayer::updateCustomColorLabels();
+        // не даємо textChanged спрацювати від нашого setString
+        auto delegate = m_customColorInput->m_delegate;
+        m_customColorInput->setDelegate(nullptr);
+        m_customColorInput->setString(longName(m_customColorChannel));
+        m_customColorInput->setDelegate(delegate);
+        m_customColorInput->m_textField->detachWithIME();
+    }
+
+    // стрілки вгору / вниз біля поля каналу (tag 1 = вгору)
+    $override
+    void onUpdateCustomColor(CCObject* sender) {
+        if (!m_fields->initDone) return CustomizeObjectLayer::onUpdateCustomColor(sender);
+
+        int c = m_customColorChannel;
+        if (c < 1 || c > MAX_CHANNEL) c = 1;
+        else if (sender->getTag() == 1) c = std::min(c + 1, MAX_CHANNEL);
+        else c = std::max(c - 1, 1);
+
+        m_customColorSelected = true;
+        m_customColorChannel = c;
+        this->updateCustomColorLabels();
+        this->updateSelected(c);
+        m_customColorSelected = false;
+        this->updateColorSprite();
+        this->updateChannelLabel(c);
+        this->highlightSelected(nullptr);
+        this->channelChanged(c);
+    }
+
+    $override
+    void onNextColorChannel(CCObject* sender) {
+        CustomizeObjectLayer::onNextColorChannel(sender);
+        if (m_fields->initDone) this->channelChanged(m_customColorChannel);
+    }
+
+    $override
+    void textChanged(CCTextInputNode* input) {
+        CustomizeObjectLayer::textChanged(input);
+        if (m_fields->initDone) this->channelChanged(m_customColorChannel);
+    }
+
+    $override
+    void onClose(CCObject* sender) {
+        commitPending();
+        CustomizeObjectLayer::onClose(sender);
+    }
+
+    // ---------- побудова панелі ----------
+
+    $override
+    bool init(GameObject* obj, CCArray* objs) {
+        if (!CustomizeObjectLayer::init(obj, objs)) return false;
+
+        commitPending(); // якщо минулого разу вікно закрили без onClose
+
+        auto channelsMenu = m_mainLayer->getChildByID("channels-menu");
+        auto specialsMenu = m_mainLayer->getChildByID("special-channels-menu");
+        if (!channelsMenu || !specialsMenu || !m_colorButtons || !m_colorTabNodes) {
+            // немає node-ids або інша версія GD — залишаємо ванільну панель
+            log::warn("Improved Color Menu: vanilla menus not found, is geode.node-ids loaded?");
+            return true;
         }
 
-        // темна вставка як на фото
-        float W = bg.size.width, H = bg.size.height;
-        m_topY = bg.getMaxY() - H * .21f;
-        float Hp = H * .57f;
-        float Wp = W * .93f;
-        float cx = bg.getMidX();
-        m_panel = CCRect(cx - Wp / 2, m_topY - Hp, Wp, Hp);
-        m_cell = std::min(Wp / 12.4f, Hp / 5.95f);
-        m_startX = cx - 6.f * m_cell;
+        loadRecent();
+        auto winSize = CCDirector::get()->getWinSize();
 
-        auto panel = CCScale9Sprite::create("square02_001.png");
-        panel->setContentSize(m_panel.size);
-        panel->setColor({ 0, 0, 0 });
-        panel->setOpacity(95);
-        panel->setPosition({ m_panel.getMidX(), m_panel.getMidY() });
-        this->addChild(panel, 1);
+        // нижні/бокові меню підтягуємо під ширшу панель
+        if (auto m = m_mainLayer->getChildByID("browse-menu")) m->setPositionY(winSize.height / 2 - 50.f);
+        if (auto m = m_mainLayer->getChildByID("copy-paste-menu")) m->setPositionY(winSize.height / 2 + 50.f);
+        if (auto m = m_mainLayer->getChildByID("selected-channel-menu")) {
+            m->setPosition(winSize.width / 2 + 125.f, winSize.height / 2 - 95.f);
+            m->setScale(.8f);
+        }
+        CCPoint selectPos { winSize.width / 2 + 210.f, winSize.height / 2 - 15.f };
+        if (auto m = m_mainLayer->getChildByID("select-channel-menu")) m->setPosition(selectPos);
+        if (auto m = m_mainLayer->getChildByID("channel-input-bg")) m->setPosition(selectPos);
+        if (auto m = m_mainLayer->getChildByID("channel-input")) m->setPosition(selectPos);
+        m_customColorInput->m_maxLabelWidth = 38.f;
 
-        float hy = m_topY - .45f * m_cell;
-        addLabel("Special", { m_startX + 1.5f * m_cell, hy }, m_cell * 3.f);
-        addLabel("Recent", { m_startX + (3.5f + COLS + .5f + 1.5f) * m_cell, hy }, m_cell * 3.f);
+        // прибираємо ванільні кнопки каналів
+        m_colorButtons->removeAllObjects();
+        channelsMenu->removeAllChildren();
+        specialsMenu->removeAllChildren();
 
-        m_pageLabel = CCLabelBMFont::create("", "goldFont.fnt");
-        m_pageLabel->setScale(.4f);
-        m_pageLabel->setPosition({ m_startX + (3.5f + COLS / 2.f) * m_cell, hy });
-        this->addChild(m_pageLabel, 2);
+        // темна підкладка
+        auto bg = CCScale9Sprite::create("square02_001.png", { 0, 0, 80, 80 });
+        bg->setOpacity(80);
+        bg->setContentSize({ 340.f, 150.f });
+        bg->setPosition(winSize / 2);
+        bg->setID("bg"_spr);
+        m_mainLayer->addChild(bg);
+        m_colorTabNodes->addObject(bg); // ховається на вкладці Text
+
+        float const midY = winSize.height / 2 - 7.5f;
+        float const titleY = midY + 72.f;
+
+        auto addTitle = [&](char const* text, float x, std::string const& id) {
+            auto t = CCLabelBMFont::create(text, "bigFont.fnt");
+            t->setScale(.35f);
+            t->setPosition(x, titleY);
+            t->setID(id);
+            m_mainLayer->addChild(t);
+            m_colorTabNodes->addObject(t);
+        };
+        auto addLine = [&](float x, std::string const& id) {
+            auto l = CCSprite::createWithSpriteFrameName("edit_vLine_001.png");
+            l->setPosition({ x, midY });
+            l->setScaleY(1.65f);
+            l->setOpacity(100);
+            l->setID(id);
+            m_mainLayer->addChild(l);
+            m_colorTabNodes->addObject(l);
+        };
+
+        // --- Special (ліворуч) ---
+        float const specialX = winSize.width / 2 - 130.f;
+        specialsMenu->setContentSize({ 90.f, 125.f });
+        specialsMenu->setPosition(specialX, midY);
+        specialsMenu->setLayout(makeGridLayout());
+        for (int ch : SPECIAL_ORDER) specialsMenu->addChild(this->makeButton(ch));
+        specialsMenu->updateLayout();
+        addTitle("Special", specialX, "special-title"_spr);
+
+        // --- Page (центр) ---
+        float const pagesX = winSize.width / 2;
+        channelsMenu->setContentSize({ 170.f, 125.f });
+        channelsMenu->setPosition(pagesX, midY);
+        channelsMenu->setLayout(makeGridLayout());
+
+        auto pageMenu = CCMenu::create();
+        pageMenu->setID("page-menu"_spr);
+        pageMenu->ignoreAnchorPointForPosition(false);
+        pageMenu->setContentSize({ 150.f, 20.f });
+        pageMenu->setPosition(pagesX, titleY);
+
+        auto pageLabel = CCLabelBMFont::create("Page 1 / 1", "bigFont.fnt");
+        pageLabel->setScale(.35f);
+        pageLabel->setPosition(70.f, 10.f);
+        pageLabel->setID("current-page");
+        pageMenu->addChild(pageLabel);
 
         for (int dir : { -1, 1 }) {
-            auto spr = CCSprite::createWithSpriteFrameName("GJ_arrow_03_001.png");
-            spr->setScale(m_cell * .8f / std::max(1.f, spr->getContentSize().width));
-            spr->setFlipX(dir < 0);
-            auto btn = makeButton(spr, dir, menu_selector(ColorPanel::onPage));
-            float x = m_startX + (3.5f + COLS / 2.f + dir * (COLS / 2.f - .3f)) * m_cell;
-            place(btn, { x, hy });
-            m_menu->addChild(btn);
+            auto spr = CCSprite::createWithSpriteFrameName(dir < 0 ? "edit_leftBtn_001.png" : "edit_rightBtn_001.png");
+            spr->setScale(.5f);
+            auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(ICMCustomizeObjectLayer::onICMPage));
+            btn->setTag(dir);
+            btn->setPosition(dir < 0 ? 10.f : 140.f, 10.f);
+            pageMenu->addChild(btn);
         }
+        m_mainLayer->addChild(pageMenu);
+        m_colorTabNodes->addObject(pageMenu);
 
-        this->buildSpecials();
-        this->buildPage();
-        this->buildRecent();
-        return true;
-    }
+        addLine(pagesX - 85.f - 4.f, "separator-1"_spr);
+        addLine(pagesX + 85.f + 4.f, "separator-2"_spr);
 
-public:
-    static ColorPanel* create(ColorSelectPopup* popup, std::vector<CCMenuItem*> orig, CCRect bg) {
-        auto ret = new ColorPanel();
-        if (ret->init(popup, std::move(orig), bg)) {
-            ret->autorelease();
-            return ret;
+        // --- Recent (праворуч) ---
+        float const recentX = winSize.width / 2 + 130.f;
+        auto recentMenu = CCMenu::create();
+        recentMenu->setID("recent-channels-menu"_spr);
+        recentMenu->ignoreAnchorPointForPosition(false);
+        recentMenu->setContentSize({ 90.f, 125.f });
+        recentMenu->setPosition(recentX, midY);
+        recentMenu->setLayout(makeGridLayout());
+        for (size_t i = 0; i < RECENT_COUNT; i++) {
+            bool has = i < s_recent.size();
+            recentMenu->addChild(this->makeButton(has ? s_recent[i] : 0, true));
         }
-        delete ret;
-        return nullptr;
-    }
-};
+        recentMenu->updateLayout();
+        m_mainLayer->addChild(recentMenu);
+        m_colorTabNodes->addObject(recentMenu);
+        addTitle("Recent", recentX, "recent-title"_spr);
 
-class $modify(BCMColorSelectPopup, ColorSelectPopup) {
-    bool init(EffectGameObject* object, CCArray* objects, ColorAction* action) {
-        if (!ColorSelectPopup::init(object, objects, action)) return false;
-        if (!m_buttonMenu || !m_mainLayer) return true;
-
-        auto bgNode = m_mainLayer->getChildByType<CCScale9Sprite>(0);
-        if (!bgNode) return true;
-        CCRect bg = bgNode->boundingBox();
-        if (bg.size.height < 10.f) return true;
-
-        // знаходимо ванільні кнопки каналів по позиції (від 24% до 78% висоти вікна)
-        std::vector<CCMenuItem*> region;
-        for (auto child : CCArrayExt<CCNode*>(m_buttonMenu->getChildren())) {
-            auto item = typeinfo_cast<CCMenuItem*>(child);
-            if (!item) continue;
-            auto p = m_mainLayer->convertToNodeSpace(
-                m_buttonMenu->convertToWorldSpace(item->getPosition())
-            );
-            float rel = (bg.getMaxY() - p.y) / bg.size.height;
-            if (rel > .24f && rel < .78f) region.push_back(item);
-        }
-        if (region.size() < 10) return true; // це не те меню — нічого не чіпаємо
-
-        // верхній ряд (P-Col 1, P-Col 2, Light BG, Default) — запам'ятовуємо
-        std::vector<CCMenuItem*> topRow;
-        for (auto item : region) {
-            auto p = m_mainLayer->convertToNodeSpace(
-                m_buttonMenu->convertToWorldSpace(item->getPosition())
-            );
-            float rel = (bg.getMaxY() - p.y) / bg.size.height;
-            if (rel < .42f) topRow.push_back(item);
-        }
-        std::sort(topRow.begin(), topRow.end(), [](CCMenuItem* a, CCMenuItem* b) {
-            return a->getPositionX() < b->getPositionX();
-        });
-
-        for (auto item : region) {
-            item->setVisible(false);
-            item->setEnabled(false);
-        }
-
-        auto panel = ColorPanel::create(this, topRow, bg);
-        if (!panel) return true;
-        int z = bgNode->getZOrder() + 1;
-        m_mainLayer->addChild(panel, z);
-        if (m_buttonMenu->getZOrder() <= z) m_buttonMenu->setZOrder(z + 1);
+        m_fields->initDone = true;
+        this->gotoPage(s_page);
+        this->gotoPageWithChannel(m_customColorChannel);
+        this->updateCustomColorLabels();
         return true;
     }
 };
